@@ -1,0 +1,28 @@
+version: "2"
+linters:
+  default: none
+  settings:
+    custom:
+      logmessagelint:
+        type: module
+        description: "Log message linter"
+        settings:
+          rules:
+            lowercase_start: true
+            english_only: true
+            no_specials: true
+            sensitive: true
+          sensitive:
+            case_insensitive: true
+            word_boundary: true
+            keywords:
+              - password
+              - passwd
+              - pass
+              - token
+              - api_key
+              - apikey
+              - secret
+              - private_key
+  enable:
+    - logmessagelint

@@ -1,0 +1,7 @@
+package fixes
+
+import "log/slog"
+
+func specials() {
+	slog.Info("hello!!!") // want `message "hello!!!" contains special symbols`
+}

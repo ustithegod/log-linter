@@ -1,0 +1,31 @@
+version: "3"
+
+tasks:
+  test:
+    desc: Run Go tests
+    cmds:
+      - go test ./...
+
+  build-linter:
+    desc: Build standalone analyzer binary
+    cmds:
+      - go build -o bin/linter ./cmd/loglinter
+
+  custom-gcl:
+    desc: Build custom golangci-lint binary with module plugin
+    cmds:
+      - golangci-lint custom --destination ./bin --name custom-gcl --version v2.10.1
+
+  lint:
+    desc: Run custom golangci-lint with this plugin
+    deps:
+      - custom-gcl
+    cmds:
+      - ./bin/custom-gcl run -c .golangci.yml ./...
+
+  lint-test-project:
+    desc: Run custom golangci-lint against test_project
+    deps:
+      - custom-gcl
+    cmds:
+      - cd ./test_project && ../bin/custom-gcl run -c ../.golangci.yml --issues-exit-code=0 ./...

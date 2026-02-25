@@ -1,0 +1,5 @@
+version: v2.10.1
+plugins:
+  - module: github.com/ustithegod/log-linter
+    path: .
+    import: github.com/ustithegod/log-linter/plugin

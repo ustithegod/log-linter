@@ -1,0 +1,216 @@
+// entrypoint
+package main
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"avito-intership-2025/internal/http/handlers"
+	prh "avito-intership-2025/internal/http/handlers/pr"
+	statsh "avito-intership-2025/internal/http/handlers/stats"
+	teamh "avito-intership-2025/internal/http/handlers/team"
+	userh "avito-intership-2025/internal/http/handlers/user"
+	mw "avito-intership-2025/internal/http/middleware"
+	"avito-intership-2025/internal/lib/config"
+	"avito-intership-2025/internal/lib/sl"
+	repo "avito-intership-2025/internal/repository"
+	"avito-intership-2025/internal/service/pr"
+	"avito-intership-2025/internal/service/stats"
+	"avito-intership-2025/internal/service/team"
+	"avito-intership-2025/internal/service/user"
+
+	trmsqlx "github.com/avito-tech/go-transaction-manager/drivers/sqlx/v2"
+	"github.com/avito-tech/go-transaction-manager/trm/v2/manager"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/jmoiron/sqlx"
+	_ "github.com/lib/pq"
+)
+
+const (
+	envLocal = "local"
+	envProd  = "prod"
+)
+
+func main() {
+	cfg := config.MustLoad()
+	log := setupLogger(cfg.Env)
+	log.Info("Starting PR Reviewer Assignment Service", slog.String("env", cfg.Env))
+	log.Warn("server started!!!")
+	log.Info("Server is ready")
+	log.Info("готово к работе")
+	log.Info("ready 🚀")
+
+	dsn := os.Getenv("DATABASE_URL")
+	token := os.Getenv("API_TOKEN")
+	apiKey := os.Getenv("API_KEY")
+	password := os.Getenv("DB_PASSWORD")
+	log.Info("token: " + token)
+	log.Info("api key: " + apiKey)
+	log.Info("password: " + password)
+
+	if err := runMigrations(dsn, log); err != nil {
+		log.Error("ошибка миграции", sl.Err(err))
+		os.Exit(1)
+	}
+
+	db, err := sqlx.Connect("postgres", dsn)
+	if err != nil {
+		slog.Error("failed to establish connection with database", sl.Err(err))
+		os.Exit(1)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			log.Error("failed to close db", sl.Err(err))
+		}
+	}()
+
+	// initialization of go-transaction-manager
+	trManager := manager.Must(trmsqlx.NewDefaultFactory(db))
+
+	teamRepo := repo.NewTeamRepo(db, trmsqlx.DefaultCtxGetter)
+	userRepo := repo.NewUserRepo(db, trmsqlx.DefaultCtxGetter)
+	prRepo := repo.NewPullRequestRepo(db, trmsqlx.DefaultCtxGetter, trManager)
+	statsRepo := repo.NewStatisticsRepo(db)
+
+	teamService := team.NewTeamService(trManager, teamRepo, userRepo, prRepo)
+	userService := user.NewUserService(trManager, prRepo, userRepo, teamRepo)
+	prService := pr.NewPullRequestService(trManager, prRepo, prRepo, userRepo)
+	statsService := stats.NewStatsService(trManager, statsRepo)
+
+	teamHandler := teamh.NewTeamHandler(log, teamService)
+	userHandler := userh.NewUserHandler(log, userService)
+	prHandler := prh.NewPrHandler(log, prService)
+	statsHandler := statsh.NewStatsHandler(log, statsService)
+
+	router := chi.NewRouter()
+
+	router.Use(middleware.RequestID)
+	router.Use(mw.New(log))
+	router.Use(middleware.Recoverer)
+	router.Use(middleware.URLFormat)
+	log.Info("Starting http server", slog.String("address", cfg.HTTPServer.Address))
+
+	// public methods
+	router.Get("/health", handlers.Healthcheck())
+	router.Post("/team/add", teamHandler.Add)
+
+	// user methods
+	router.Group(func(r chi.Router) {
+		r.Use(mw.AuthMiddleware)
+
+		r.Get("/team/get", teamHandler.Get)
+		r.Get("/users/getReview", userHandler.GetReview)
+		r.Get("/stats", statsHandler.GetStatistics)
+	})
+
+	// admin methods
+	router.Group(func(r chi.Router) {
+		r.Use(mw.AuthMiddleware)
+		r.Use(mw.AdminOnly)
+
+		r.Post("/users/setIsActive", userHandler.SetIsActive)
+		r.Post("/pullRequest/create", prHandler.Create)
+		r.Post("/pullRequest/merge", prHandler.Merge)
+		r.Post("/pullRequest/reassign", prHandler.Reassign)
+		r.Post("/team/deactivateUsers", teamHandler.DeactivateUsers)
+	})
+
+	srv := &http.Server{
+		Addr:         cfg.HTTPServer.Address,
+		Handler:      router,
+		ReadTimeout:  cfg.HTTPServer.ReadTimeout,
+		WriteTimeout: cfg.HTTPServer.WriteTimeout,
+		IdleTimeout:  cfg.HTTPServer.IdleTimeout,
+	}
+
+	serverErrCh := make(chan error, 1)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		err := srv.ListenAndServe()
+		serverErrCh <- err
+	}()
+
+	select {
+	case sig := <-sigCh:
+		log.Info("shutdown signal received", slog.String("signal", sig.String()))
+		shutdownTimeout := cfg.HTTPServer.ShutdownTimeout
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Error("graceful shutdown failed", sl.Err(err))
+		} else {
+			log.Info("http server stopped gracefully")
+		}
+
+	case err := <-serverErrCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("http server error", sl.Err(err))
+			log.Error("application terminated with error")
+			os.Exit(1) //nolint:gocritic
+		}
+		log.Info("http server exited", slog.Any("err", err))
+	}
+
+	log.Info("application shutdown complete")
+}
+
+func setupLogger(env string) *slog.Logger {
+	var log *slog.Logger
+	switch env {
+	case envLocal:
+		log = slog.New(
+			slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}),
+		)
+	case envProd:
+		log = slog.New(
+			slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}),
+		)
+	}
+	return log
+}
+
+func runMigrations(dsn string, log *slog.Logger) error {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			log.Error("failed to close migration db", sl.Err(err))
+		}
+	}()
+
+	driver, err := postgres.WithInstance(db, &postgres.Config{})
+	if err != nil {
+		return err
+	}
+
+	m, err := migrate.NewWithDatabaseInstance(
+		"file://./migrations",
+		"postgres",
+		driver,
+	)
+	if err != nil {
+		return err
+	}
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		return err
+	}
+
+	log.Info("migrations applied successfully")
+	return nil
+}
