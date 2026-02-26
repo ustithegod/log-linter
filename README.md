@@ -3,6 +3,7 @@
 Позиция: Backend-разработка. Golang
 
 **Васильев Савелий**
+
 **Контакты:** 
 - **email:** ust1vasiljev@yandex.ru
 - **telegram:** @ustithegoddd
